@@ -1,18 +1,19 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <WiFiClientSecure.h>
-#include <SPI.h>
 #include <SD.h>
 #include <Preferences.h>
+#include <Wire.h>
 #include <DS1302.h>
 
 Preferences preferences;
 char filename[20]; //20181019 //actually 201810191530
 bool getTimeOk = false, uploadStringOk;
 unsigned long currentTime, syncTime, syncMillis, timeStamp = 0;
-DS1302 rtc(22, 4, 21);
+DS1302 rtc(25, 33, 32); // 22, 4, 21
 hw_timer_t * timer = NULL;
-long pH, temperature, conductivity;
+String conductivity, pH;
+long temperature;
 TaskHandle_t UpTH, TimeTH, CloudTH, LoopTH;
 SemaphoreHandle_t UpSH, TimeSH, CloudSH;
 File sdFile;
@@ -41,7 +42,7 @@ void WiFiEvent(WiFiEvent_t event) {
 }
 
 void setup() {
-  vTaskPrioritySet(NULL,5); //SensorTask run at highest priority to keep time accurate
+  vTaskPrioritySet(NULL, 5); //SensorTask run at highest priority to keep time accurate
   Serial.begin(115200); delay(10);
   if (!SD.begin()) {
     Serial.println("Card Mount Failed!");
@@ -49,26 +50,33 @@ void setup() {
   }
   preferences.begin("my-app", false);
   syncTime = preferences.getUInt("sync_time", 0); // get timeStamp that the DS module is updated from Internet
+  Wire1.begin(21, 22);
 
   TimeSH = xSemaphoreCreateBinary();
   UpSH = xSemaphoreCreateBinary();
   CloudSH = xSemaphoreCreateBinary();
   xTaskCreate(TimeTask, "time", 5000, NULL, 4, &TimeTH); // next highest priority is for TimeTask
   xTaskCreatePinnedToCore(UpTask, "upload", 10000, NULL, 3, &UpTH, 1);
-  WiFi.setAutoReconnect(false); WiFi.onEvent(WiFiEvent); //WiFi.begin("Khoa Chu - Redmi", "eeit2013vgu1649");//WiFi.begin("Knab", "quachthiducanh");
-  WiFi.begin("Khoa Chu - Redmi", "eeit2013vgu1649");
-  
+  WiFi.setAutoReconnect(false); WiFi.onEvent(WiFiEvent); //WiFi.begin("Khoa Chu - Redmi", "eeit2013vgu1649");//WiFi.begin("Knab", "quachthiducanh");//WiFi.begin("cc3120test", "");
+  WiFi.begin("Knab", "quachthiducanh");
+
   LoopTH = xTaskGetCurrentTaskHandle();
   xTaskCreatePinnedToCore(CloudTask, "drive", 20000, NULL, 2, &CloudTH, 0); //CloudTask run in another core
 
   timer = timerBegin(0, 40000, true);
   timerAttachInterrupt(timer, &onTimer, true);
   timerAlarmWrite(timer, 30000, true); //60000 //2000 is one second
-  
-  Time time_DS = rtc.time();
-  tm time_h = {time_DS.sec, time_DS.min, time_DS.hr, time_DS.date, time_DS.mon - 1, time_DS.yr - 1900};
-  currentTime = mktime(&time_h); Serial.print("DS module time: ");Serial.println(currentTime);
-  if (currentTime - syncTime > 3600 || time_DS.yr < 2019) { // 2592000 //current time is so wrong
+
+//  Time time_DS = rtc.time();
+//  tm time_h = {time_DS.sec, time_DS.min, time_DS.hr, time_DS.date, time_DS.mon - 1, time_DS.yr - 1900};
+//  currentTime = mktime(&time_h);
+  Wire.begin(26, 27);
+  DS3231_init(DS3231_CONTROL_INTCN);
+  ts time_DS;
+  DS3231_get(&time_DS);
+  currentTime = time_DS.unixtime;
+  Serial.print("DS module time: "); Serial.println(currentTime);
+  if (currentTime - syncTime > 3600 || time_DS.year < 2019) { // 2592000 //current time is so wrong
     Serial.print("Wait to sync time");
     xSemaphoreGive(TimeSH);
     while (!getTimeOk) {
@@ -81,10 +89,23 @@ void setup() {
 
 void loop() { // SensorTask
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // wait until timer notify, use this instead of xSemaphoreTake because SensorTask is never suspended
-  conductivity = analogRead(39);
-  pH = analogRead(34);
+//  conductivity = analogRead(39);
+//  pH = analogRead(34);
+  Wire1.beginTransmission(99);
+  Wire1.write('r');
+  Wire1.endTransmission();
+  Wire1.beginTransmission(100);
+  Wire1.write('r');
+  Wire1.endTransmission();
+  delay(790);
+  Wire1.requestFrom(100, 20);
+  Wire1.read();
+  conductivity = Wire1.readStringUntil('\0');
+  Wire1.requestFrom(99, 20);
+  Wire1.read();
+  pH = Wire1.readStringUntil('\0');
   temperature = analogRead(36);
-  Serial.print("Sensor Value: "); Serial.printf("%04d %04d %04d\n", conductivity, pH, temperature);
+  Serial.println(String("Sensor Value: ") + conductivity + pH + temperature);
   if (getTimeOk) { // if TimeTask get time success, update time
     getTimeOk = false;
     currentTime = syncTime + (millis() - syncMillis + 500) / 1000; // syncTime is in between timer ticks
@@ -96,7 +117,7 @@ void loop() { // SensorTask
   if (currentTime >= timeStamp) { // create new file when time exceed midnight
     if (count > 0) count = 254; // signal CloudTask to stop incrementting 'count' after create new file
     tm time_h;
-    timeStamp = currentTime - currentTime%120 + 120; //86400 // next midnight
+    timeStamp = currentTime - currentTime % 120 + 120; //86400 // next midnight
     time_t x = timeStamp - 120; // none
     gmtime_r(&x, &time_h); // (time_t*)&currentTime
     sprintf(filename, "/esp32/%d%02d%02d%02d%02d", time_h.tm_year + 1900, time_h.tm_mon + 1, time_h.tm_mday, time_h.tm_hour, time_h.tm_min); //hhmm
@@ -117,7 +138,7 @@ void UpTask(void* param) {
   unsigned long start, now = 0;
   WiFiClient client;
   String payload, request, adafruit = "POST /api/v2/monokia/groups/as/data HTTP/1.1\nHost: io.adafruit.com\n" \
-                   "X-AIO-Key: b19057d0daee4a4db05b4c0c1ed9166d\nContent-Type: application/json\nContent-Length: ";
+                                      "X-AIO-Key: b19057d0daee4a4db05b4c0c1ed9166d\nContent-Type: application/json\nContent-Length: ";
   for (;;) {
     xSemaphoreTake(UpSH, portMAX_DELAY); // wait until SensorTask finish reading sensors
     if (now != currentTime)
@@ -137,7 +158,7 @@ void UpTask(void* param) {
           delay(10);
         }
         if (client.available()) {
-          if (client.findUntil("200","\n")) {
+          if (client.findUntil("200", "\n")) {
             Serial.println("Success");
           } else {
             delay(2000);
@@ -156,11 +177,12 @@ void TimeTask(void* param) {
   Udp.begin(8888);
   byte packet[48], t = 0;
   for (;;) {
-    xSemaphoreTake(TimeSH, portMAX_DELAY);Serial.println("timeSH taken");
+    xSemaphoreTake(TimeSH, portMAX_DELAY); Serial.println("timeSH taken");
     if (currentTime - syncTime > 1800) { //1296000 if current time differ 15 days from last sync time
       Serial.println("time Need Sync");
       for (;;) {
-        if (WiFi.status() == WL_DISCONNECTED) {Serial.println("time Suspended");
+        if (WiFi.status() == WL_DISCONNECTED) {
+          Serial.println("time Suspended");
           vTaskSuspend(NULL); // suspend TimeTask itself manually outside WiFiEvent when wifi disconnected
         }
         Serial.println("Transmit NTP Request");
@@ -182,14 +204,15 @@ void TimeTask(void* param) {
             getTimeOk = true;
             tm time_h;
             gmtime_r((time_t*)&syncTime, &time_h);
-            Time time_DS(time_h.tm_year + 1900, time_h.tm_mon + 1, time_h.tm_mday, time_h.tm_hour, time_h.tm_min, time_h.tm_sec, Time::kSunday); // store time to DS module
-            rtc.time(time_DS);
+//            Time time_DS(time_h.tm_year + 1900, time_h.tm_mon + 1, time_h.tm_mday, time_h.tm_hour, time_h.tm_min, time_h.tm_sec, Time::kSunday); // store time to DS module
+//            rtc.time(time_DS);
+            DS3231_set(ts {time_h.tm_sec, time_h.tm_min, time_h.tm_hour, time_h.tm_mday, time_h.tm_mon + 1, time_h.tm_year + 1900});
             preferences.putUInt("sync_time", syncTime); // store time to Esp32
-            Serial.printf("%d-%d-%d %d:%d:%d\n",time_h.tm_year + 1900,time_h.tm_mon + 1,time_h.tm_mday,time_h.tm_hour,time_h.tm_min,time_h.tm_sec);
+            Serial.printf("%d-%02d-%02d %02d:%02d:%02d\n", time_h.tm_year + 1900, time_h.tm_mon + 1, time_h.tm_mday, time_h.tm_hour, time_h.tm_min, time_h.tm_sec);
             break;
           }
         }
-      }Serial.println("get Time Ok");
+      } Serial.println("get Time Ok");
     }
   }
 }
@@ -205,7 +228,7 @@ void CloudTask(void* param) {
   File file, esp32 = SD.open("/esp32");
   File timeFile = SD.open("/time");
   uploadTime = timeFile.parseInt(); // store lastest line upload time in sdcard/time file
-  
+
   for (;;) {
     xSemaphoreTake(CloudSH, portMAX_DELAY); Serial.println("cloudTask running");
     if (uploadTime != currentTime) {
@@ -233,7 +256,8 @@ void CloudTask(void* param) {
             }
             delay(10);
           }
-          if (scriptClient.available()) {Serial.println("string Uploaded");
+          if (scriptClient.available()) {
+            Serial.println("string Uploaded");
             timeFile = SD.open("/time", FILE_WRITE);
             timeFile.print(now); //last line
             timeFile.close();
@@ -246,15 +270,16 @@ void CloudTask(void* param) {
           scriptClient.stop();
         }
       }
-  
+
       uploadStringOk = false;
-      if (currentTime != uploadTime) {Serial.println("currentTime != uploadTime");
+      if (currentTime != uploadTime) {
+        Serial.println("currentTime != uploadTime");
         if (uploadTime != 0) { // uploadTime = 0 means never upload to Cloud
           tm time_h;
           char uploadfilename[20]; // the file that contains uploadTime
-          time_t x = uploadTime - uploadTime%120; // none
+          time_t x = uploadTime - uploadTime % 120; // none
           gmtime_r(&x, &time_h); // (time_t*)&uploadTime
-          sprintf(uploadfilename,"/esp32/%d%02d%02d%02d%02d",time_h.tm_year + 1900,time_h.tm_mon + 1,time_h.tm_mday,time_h.tm_hour,time_h.tm_min);
+          sprintf(uploadfilename, "/esp32/%d%02d%02d%02d%02d", time_h.tm_year + 1900, time_h.tm_mon + 1, time_h.tm_mday, time_h.tm_hour, time_h.tm_min);
           //Serial.println(uploadfilename);Serial.println(file.name());
           Serial.println(uploadfilename);
           while (String(file.name()) != String(uploadfilename)) { // iterate through esp32 folder until find the lastest uploaded file
@@ -269,7 +294,8 @@ void CloudTask(void* param) {
         uint32_t readPosition;
         for (;;) {
           isLastestFile = String(file.name()) == String(filename);
-          while (file.available()) {Serial.println("line Uploading"); // upload until end of current file
+          while (file.available()) {
+            Serial.println("line Uploading"); // upload until end of current file
             readPosition = file.position();
             i = 0;
             while (i < 5 ) { //250 // maximum 250 lines in request
@@ -279,12 +305,12 @@ void CloudTask(void* param) {
             length = file.position() - readPosition;
             uint8_t bf[length];
             file.seek(readPosition);
-            file.read(bf,length);
+            file.read(bf, length);
             request = gas + length + "\n\n";
             for (;;) {
               if (!scriptClient.connected()) while (!scriptClient.connect("script.google.com", 443)) Serial.println("script Connection failed");
               scriptClient.print(request);
-              scriptClient.write(bf,length);
+              scriptClient.write(bf, length);
               start = millis();
               while (!scriptClient.available()) {
                 if (millis() - start > 5000) {
@@ -293,11 +319,12 @@ void CloudTask(void* param) {
                 }
                 delay(10);
               }
-              if (scriptClient.available()) {Serial.println("line Uploaded");
+              if (scriptClient.available()) {
+                Serial.println("line Uploaded");
                 if (i == 1) {
                   file.seek(readPosition);
                 } else {
-                  file.seek(file.position()-33);
+                  file.seek(file.position() - 33);
                   file.find("\n");
                 }
                 uploadTime = file.parseInt();
@@ -311,18 +338,21 @@ void CloudTask(void* param) {
               scriptClient.stop();
             }
           }
-          if (isLastestFile) {Serial.println("lastest File");
+          if (isLastestFile) {
+            Serial.println("lastest File");
             if (uploadTime == currentTime) break; // stop uploading from sdcard
             else {
               readPosition = file.position();
               file = SD.open(file.name()); // open current file again and read from last upload position
               file.seek(readPosition);
             }
-          } else {Serial.println("not Lastest File");
+          } else {
+            Serial.println("not Lastest File");
             file = esp32.openNextFile(); //if(!file) break;
             WiFiClientSecure driveClient;
             String content;
-            while (String(file.name()) != String(filename)) {Serial.print("uploading file: ");Serial.println(file.name());
+            while (String(file.name()) != String(filename)) {
+              Serial.print("uploading file: "); Serial.println(file.name());
               content = file.readString(); // read whole file
               request = drive + token + "\nContent-Type: multipart/related; boundary=k8c\nContent-Length: " + (168 + content.length()) +
                         "\n\n--k8c\nContent-Type: application/json; charset=UTF-8\n\n{\"name\":\"" + String(file.name()).substring(7) +
@@ -339,9 +369,10 @@ void CloudTask(void* param) {
                   delay(10);
                 }
                 if (driveClient.available()) {//while (driveClient.available()) Serial.write(driveClient.read()); while(1){};
-                  if (driveClient.findUntil("200","\n")) {Serial.println("file Uploaded");
+                  if (driveClient.findUntil("200", "\n")) {
+                    Serial.println("file Uploaded");
                     if (file.size() > 33) {
-                      file.seek(-33,SeekEnd);
+                      file.seek(-33, SeekEnd);
                       file.find("\n");
                     } else file.seek(0);
                     timeFile = SD.open("/time", FILE_WRITE);
@@ -354,9 +385,9 @@ void CloudTask(void* param) {
                     for (;;) {
                       while (!driveClient.connect("googleapis.com", 443)) Serial.println("auth Connection failed");
                       driveClient.print("POST /oauth2/v4/token?client_id=463875113005-icovngqrabn2hass5tug5ik5m436ks2k.apps.googleusercontent.com&" \
-                      "client_secret=8PWn96NTst2-rbkaXToWoi6F&refresh_token=1/7C-dMwDk771wT5lads8os4_mziPZspcIU6ndw_ZJpi4&grant_type=refresh_token HTTP/1.1\n" \
-                      "Host: www.googleapis.com\n" \
-                      "Content-Length: 0\n\n");
+                                        "client_secret=8PWn96NTst2-rbkaXToWoi6F&refresh_token=1/7C-dMwDk771wT5lads8os4_mziPZspcIU6ndw_ZJpi4&grant_type=refresh_token HTTP/1.1\n" \
+                                        "Host: www.googleapis.com\n" \
+                                        "Content-Length: 0\n\n");
                       start = millis();
                       while (!driveClient.available()) {
                         if (millis() - start > 5000) {
@@ -368,7 +399,7 @@ void CloudTask(void* param) {
                       if (driveClient.available()) {
                         driveClient.find("s_token\": \""); // access_token
                         token = driveClient.readStringUntil('"');
-                        Serial.print("token: ");Serial.println(token);
+                        Serial.print("token: "); Serial.println(token);
                         request = drive + token + "\nContent-Type: multipart/related; boundary=k8c\nContent-Length: " + (168 + content.length()) +
                                   "\n\n--k8c\nContent-Type: application/json; charset=UTF-8\n\n{\"name\":\"" + String(file.name()).substring(7) +
                                   "\",\"mimeType\":\"application/vnd.google-apps.document\"}\n\n--k8c\nContent-Type: text/plain\n\n" + content + "\n--k8c--";
