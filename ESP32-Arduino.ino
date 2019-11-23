@@ -49,9 +49,10 @@ void setup() {
   syncTime = preferences.getUInt("sync_time", 0); //get timeStamp when the DS module was updated from Internet
   Wire1.begin(21, 22); Wire.begin(26, 27);
 
-  TimeSH = xSemaphoreCreateBinary(); LiveSH = xSemaphoreCreateBinary(); CloudSH = xSemaphoreCreateBinary(); LoopTH = xTaskGetCurrentTaskHandle(); //init value: 0
-  vSemaphoreCreateBinary(fileNameSH); vSemaphoreCreateBinary(sensorsSH); vSemaphoreCreateBinary(sensorsStringSH);                                 //init value: 1
-
+  TimeSH = xSemaphoreCreateBinary(); LiveSH = xSemaphoreCreateBinary(); CloudSH = xSemaphoreCreateBinary();       //init value: 0
+  vSemaphoreCreateBinary(fileNameSH); vSemaphoreCreateBinary(sensorsSH); vSemaphoreCreateBinary(sensorsStringSH); //init value: 1
+  LoopTH = xTaskGetCurrentTaskHandle();
+  
   vTaskPrioritySet(NULL, 5);                                                //SensorTask - Core 1 - priority 5 (highest)
   xTaskCreate(TimeTask, "time", 2500, NULL, 4, &TimeTH);                    //TimeTask priority 4
   xTaskCreatePinnedToCore(LiveTask, "upload", 3000, NULL, 3, &LiveTH, 1);   //LiveTask - Core 1 - priority 3
